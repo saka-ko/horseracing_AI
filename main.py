@@ -94,7 +94,10 @@ for col in categorical_cols:
 num_features = [f for f in features if f not in categorical_cols]
 for col in num_features:
     if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(df[col].mean())
+        # まず数値に変換する（文字はNaNになる）
+        temp_col = pd.to_numeric(df[col], errors='coerce')
+        # 変換後のデータを使って平均値を計算し、穴埋めする
+        df[col] = temp_col.fillna(temp_col.mean())
 
 # ==========================================
 # 3. モデル学習と評価 (LightGBM)
