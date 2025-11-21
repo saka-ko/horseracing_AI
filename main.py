@@ -9,7 +9,8 @@ from sklearn.calibration import CalibratedClassifierCV
 # ==========================================
 # 1. データの読み込み
 # ==========================================
-file_path = '過去5年分レース結果.csv' 
+# ★ 5年分のファイル名を指定
+file_path = 'race_data_5years.csv' 
 
 print(f"データを読み込んでいます... ({file_path})")
 try:
@@ -25,7 +26,6 @@ print(f"データ読み込み完了: {len(df)}件")
 # ==========================================
 # 2. 特徴量エンジニアリング
 # ==========================================
-
 def clean_numeric(x):
     if pd.isna(x): return np.nan
     x_str = str(x).translate(str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)}))
@@ -43,7 +43,7 @@ if '前走着順' in df.columns:
 else:
     df['前走着順_num'] = np.nan
 
-# --- Factor Creation ---
+# --- 展開・PCI ---
 pci_cols = ['前PCI', '前走PCI', '前RPCI', '前走RPCI', '前PCI3', '前走PCI3']
 for col in pci_cols:
     if col in df.columns:
@@ -91,7 +91,7 @@ features = [f for f in features if f in df.columns]
 categorical_cols = ['場所', '芝・ダ', '馬場状態', '種牡馬', '騎手コード', '調教師コード', 
                     '前走芝・ダ', 'コースID', '騎手調教師コンビ']
 
-encoders = {} # 出馬表の予測で使うために辞書として保存
+encoders = {}
 for col in categorical_cols:
     if col in df.columns:
         le = LabelEncoder()
@@ -112,65 +112,86 @@ df['target_win'] = (df['着順_num'] == 1).astype(int)
 X = df[features]
 y = df['target_win']
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# シミュレーション用にレースIDも保持しておく
+X_train, X_test, y_train, y_test, ids_train, ids_test = train_test_split(
+    X, y, df[race_id_col], test_size=0.2, random_state=42
+)
 
 print("\n学習開始... (設定: 高速モード cv=3)")
 
-# Base Model 
 base_model = lgb.LGBMClassifier(
     random_state=42, 
     n_estimators=100,
     min_child_samples=50, 
     reg_alpha=0.1,
-    n_jobs=-1  # ★CPUフル活用
+    n_jobs=-1
 )
 
-# Calibrated Classifier (cv=3 に変更して高速化)
 calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
 calibrated_model.fit(X_train, y_train)
 
-# 重要度表示用
-base_model.fit(X_train, y_train)
-
 # ==========================================
-# 4. 結果分析
+# 4. 💰 回収率バックテスト
 # ==========================================
 prob_win = calibrated_model.predict_proba(X_test)[:, 1]
 
 results = X_test.copy()
+results['レースID'] = ids_test
 results['馬名'] = df.loc[X_test.index, '馬名']
 results['着順'] = df.loc[X_test.index, '着順_num']
 results['単勝オッズ'] = pd.to_numeric(df.loc[X_test.index, '単勝オッズ'], errors='coerce').fillna(0)
-results['AI勝率予測(%)'] = (prob_win * 100).round(2)
+results['AI勝率予測(%)'] = (prob_win * 100)
 results['期待値'] = (results['AI勝率予測(%)'] / 100) * results['単勝オッズ']
 
-# 簡易診断
-def make_comment(row):
-    reasons = []
-    if '騎手調教師コンビ' in df.columns:
-         # コンビ相性が良いなどの判定ロジック（簡易）
-         pass
-    if row['指数'] > 110: reasons.append("高指数")
-    if row['前走PCI_val'] >= 58: reasons.append("瞬発力◎")
-    elif row['前走PCI_val'] <= 42: reasons.append("ハイペース向")
-    if row['同レース逃げ馬数'] == 0 and row['前走脚質数値'] <= 2: reasons.append("単騎逃げ濃厚")
-    if not reasons: return "-"
-    return ",".join(reasons)
+# 100倍以上の大穴はノイズとして除外する（現実的な運用のため）
+results = results[results['単勝オッズ'] < 100]
 
-results['診断'] = results.apply(make_comment, axis=1)
+print("\n" + "="*50)
+print(" 💰 回収率シミュレーション結果 (単勝ベタ買い)")
+print("="*50)
 
-auc = roc_auc_score(y_test, prob_win)
-print(f"\nモデル精度(AUC): {auc:.4f}")
+# --- パターンA: 期待値が「○以上」なら全部買う ---
+print("\n【パターンA】期待値によるフィルタリング")
+print(f"{'条件(期待値)':<10} | {'購入件数':<8} | {'的中率':<8} | {'回収率':<8} | {'収支(1点100円)':<10}")
+print("-" * 65)
 
-print("\n=== 【期待値ランキング】トップ15 (リアル確率版) ===")
-display_cols = ['馬名', '着順', '単勝オッズ', 'AI勝率予測(%)', '期待値', '診断']
-sorted_results = results.sort_values('期待値', ascending=False)
-valid_results = sorted_results[
-    (sorted_results['単勝オッズ'] > 0) & 
-    (sorted_results['単勝オッズ'] < 300)
-]
-print(valid_results[display_cols].head(15))
+for threshold in [0.8, 1.0, 1.2, 1.5, 2.0, 3.0]:
+    # 条件に合う馬を抽出
+    bet_df = results[results['期待値'] >= threshold]
+    
+    if len(bet_df) == 0:
+        continue
+        
+    bet_count = len(bet_df)
+    hits = bet_df[bet_df['着順'] == 1]
+    hit_count = len(hits)
+    
+    investment = bet_count * 100
+    return_amount = hits['単勝オッズ'].sum() * 100
+    recovery_rate = (return_amount / investment) * 100
+    profit = return_amount - investment
+    
+    print(f"{threshold:>6.1f}以上 | {bet_count:>8} | {hit_count/bet_count*100:>7.1f}% | {recovery_rate:>7.1f}% | {profit:>+10.0f}円")
 
-print("\n=== 重要度ランキング ===")
-importance = pd.DataFrame({'feature': features, 'importance': base_model.feature_importances_})
-print(importance.sort_values('importance', ascending=False).head(10))
+# --- パターンB: 各レースで「一番期待値が高い馬」だけ買う ---
+print("\n【パターンB】各レース 期待値No.1の馬だけ購入")
+# レースごとに期待値最大の行を取得
+top_picks = results.loc[results.groupby('レースID')['期待値'].idxmax()]
+
+# さらに「そのNo.1の馬の期待値が1.0を超えている場合のみ」買う条件を追加
+top_picks_filtered = top_picks[top_picks['期待値'] >= 1.0]
+
+bet_count_b = len(top_picks_filtered)
+hits_b = top_picks_filtered[top_picks_filtered['着順'] == 1]
+hit_count_b = len(hits_b)
+investment_b = bet_count_b * 100
+return_amount_b = hits_b['単勝オッズ'].sum() * 100
+recovery_rate_b = (return_amount_b / investment_b) * 100 if bet_count_b > 0 else 0
+profit_b = return_amount_b - investment_b
+
+print(f"条件: レース内1位 & 期待値1.0以上")
+print(f"購入件数: {bet_count_b}件")
+print(f"的中率  : {hit_count_b / bet_count_b * 100:.1f}%")
+print(f"回収率  : {recovery_rate_b:.1f}%")
+print(f"収支    : {profit_b:+,.0f}円")
+print("="*50)
