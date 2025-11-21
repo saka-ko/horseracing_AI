@@ -4,12 +4,12 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
-from sklearn.calibration import CalibratedClassifierCV # ★確率補正用
+from sklearn.calibration import CalibratedClassifierCV
 
 # ==========================================
 # 1. データの読み込み
 # ==========================================
-file_path = '過去5年分レース結果.csv' 
+file_path = 'race_data_5years.csv' 
 
 print(f"データを読み込んでいます... ({file_path})")
 try:
@@ -91,11 +91,13 @@ features = [f for f in features if f in df.columns]
 categorical_cols = ['場所', '芝・ダ', '馬場状態', '種牡馬', '騎手コード', '調教師コード', 
                     '前走芝・ダ', 'コースID', '騎手調教師コンビ']
 
+encoders = {} # 出馬表の予測で使うために辞書として保存
 for col in categorical_cols:
     if col in df.columns:
         le = LabelEncoder()
         df[col] = df[col].fillna('unknown').astype(str)
         df[col] = le.fit_transform(df[col])
+        encoders[col] = le
 
 num_features = [f for f in features if f not in categorical_cols]
 for col in num_features:
@@ -104,7 +106,7 @@ for col in num_features:
         df[col] = temp_col.fillna(temp_col.mean())
 
 # ==========================================
-# 3. モデル学習 (確率補正付き)
+# 3. モデル学習 (高速化版)
 # ==========================================
 df['target_win'] = (df['着順_num'] == 1).astype(int)
 X = df[features]
@@ -112,28 +114,27 @@ y = df['target_win']
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-print("\n学習開始... (過学習の抑制と確率補正を実施中)")
+print("\n学習開始... (設定: 高速モード cv=3)")
 
-# Base Model (LightGBM) - パラメータを少し保守的にして過学習を防ぐ
+# Base Model 
 base_model = lgb.LGBMClassifier(
     random_state=42, 
     n_estimators=100,
-    min_child_samples=50, # データが少ない条件（レアなコンビなど）で判断させない
-    reg_alpha=0.1         # ノイズ除去
+    min_child_samples=50, 
+    reg_alpha=0.1,
+    n_jobs=-1  # ★CPUフル活用
 )
 
-# Calibrated Classifier (確率を現実に合わせるラッパー)
-# cv=5 で5分割交差検証を行いながら、確率を現実に近づける
-calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=5)
+# Calibrated Classifier (cv=3 に変更して高速化)
+calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
 calibrated_model.fit(X_train, y_train)
 
-# 重要度の表示用にはベースモデルを一度fitさせる必要がある
+# 重要度表示用
 base_model.fit(X_train, y_train)
 
 # ==========================================
 # 4. 結果分析
 # ==========================================
-# 補正済みの確率を取得
 prob_win = calibrated_model.predict_proba(X_test)[:, 1]
 
 results = X_test.copy()
@@ -143,25 +144,16 @@ results['単勝オッズ'] = pd.to_numeric(df.loc[X_test.index, '単勝オッズ
 results['AI勝率予測(%)'] = (prob_win * 100).round(2)
 results['期待値'] = (results['AI勝率予測(%)'] / 100) * results['単勝オッズ']
 
-# --- 簡易診断コメント作成 ---
-# なぜ評価されたかを簡易的にテキスト化
+# 簡易診断
 def make_comment(row):
     reasons = []
-    # コンビ相性
-    if row['騎手調教師コンビ'] in df[df['target_win']==1]['騎手調教師コンビ'].values:
-       # ※簡易的な判定です。本来はもっと複雑ですが、目安として
-       pass 
-    
-    # 指数評価
+    if '騎手調教師コンビ' in df.columns:
+         # コンビ相性が良いなどの判定ロジック（簡易）
+         pass
     if row['指数'] > 110: reasons.append("高指数")
-    
-    # ペース評価 (PCIが55以上なら瞬発力、45以下なら持続力)
     if row['前走PCI_val'] >= 58: reasons.append("瞬発力◎")
     elif row['前走PCI_val'] <= 42: reasons.append("ハイペース向")
-    
-    # 展開
     if row['同レース逃げ馬数'] == 0 and row['前走脚質数値'] <= 2: reasons.append("単騎逃げ濃厚")
-    
     if not reasons: return "-"
     return ",".join(reasons)
 
@@ -170,19 +162,15 @@ results['診断'] = results.apply(make_comment, axis=1)
 auc = roc_auc_score(y_test, prob_win)
 print(f"\nモデル精度(AUC): {auc:.4f}")
 
-# --- 期待値ランキング ---
 print("\n=== 【期待値ランキング】トップ15 (リアル確率版) ===")
 display_cols = ['馬名', '着順', '単勝オッズ', 'AI勝率予測(%)', '期待値', '診断']
 sorted_results = results.sort_values('期待値', ascending=False)
-
-# オッズが極端すぎる(単勝300倍以上)など、ノイズになりそうなものは除外して表示
 valid_results = sorted_results[
     (sorted_results['単勝オッズ'] > 0) & 
     (sorted_results['単勝オッズ'] < 300)
 ]
 print(valid_results[display_cols].head(15))
 
-# --- 重要度ランキング ---
 print("\n=== 重要度ランキング ===")
 importance = pd.DataFrame({'feature': features, 'importance': base_model.feature_importances_})
 print(importance.sort_values('importance', ascending=False).head(10))
