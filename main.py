@@ -9,7 +9,7 @@ from sklearn.preprocessing import LabelEncoder
 # 1. データの読み込み
 # ==========================================
 # ★ 5年分のファイル名を指定
-file_path = 'race_data_5years.csv' 
+file_path = '過去5年分レース結果.csv' 
 
 print(f"データを読み込んでいます... ({file_path})")
 try:
