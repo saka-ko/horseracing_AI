@@ -123,6 +123,84 @@ calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
 calibrated_model.fit(X, y)
 print("✅ 学習完了！")
 
+# ==========================================
+# 1.5 モデル評価（的中率・回収率チェック）
+# ==========================================
+from sklearn.model_selection import train_test_split
+
+# 回収率計算のために「単勝オッズ」が必要なので確保しておく
+# ※学習データに「単勝」または「単勝オッズ」という列がある前提です
+odds_col_train = None
+for c in ['単勝', '単勝オッズ', '確定単勝オッズ']:
+    if c in df_train.columns:
+        odds_col_train = c
+        break
+
+# オッズがない場合は評価できないので簡易学習のみ行う
+if odds_col_train is None:
+    print("⚠️ 学習データに「単勝オッズ」列がないため、回収率計算をスキップします。")
+    model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
+    calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
+    calibrated_model.fit(X, y)
+else:
+    print("\n📊 モデルの精度と回収率を検証中（データを8:2に分割）...")
+    
+    # 検証用にデータを分割 (学習:80%, 検証:20%)
+    # ※厳密には時系列分割が望ましいですが、簡易チェックとしてランダム分割を使用
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # 検証用データのオッズとレースID（グループ化用）を確保
+    val_indices = X_val.index
+    val_odds = df_train.loc[val_indices, odds_col_train].apply(force_numeric).fillna(0)
+    
+    # レースIDがない場合は擬似的に作る（評価用）
+    if 'レースID(新)' in df_train.columns:
+        val_rids = df_train.loc[val_indices, 'レースID(新)']
+    else:
+        # 適当なグループ化（あくまで簡易版）
+        val_rids = df_train.loc[val_indices].index 
+
+    # モデル学習 (学習データのみ使用)
+    base_model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
+    calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
+    calibrated_model.fit(X_train, y_train)
+
+    # 検証データで予測
+    probs_val = calibrated_model.predict_proba(X_val)[:, 1]
+    
+    # --- シミュレーション ---
+    # 検証データをDataFrameにまとめて計算
+    df_val_sim = X_val.copy()
+    df_val_sim['actual_target'] = y_val
+    df_val_sim['prob'] = probs_val
+    df_val_sim['odds'] = val_odds
+    df_val_sim['rid'] = val_rids
+    
+    # レースごとに「AI評価1位」の馬を抽出
+    # (確率が最も高い馬を1頭だけ買うシミュレーション)
+    target_bets = df_val_sim.sort_values('prob', ascending=False).groupby('rid').head(1)
+    
+    # 集計
+    total_races = len(target_bets)
+    hits = target_bets[target_bets['actual_target'] == 1]
+    hit_count = len(hits)
+    return_amount = hits['odds'].sum() * 100 # 100円賭け
+    bet_amount = total_races * 100
+    
+    accuracy = (hit_count / total_races) * 100
+    recovery_rate = (return_amount / bet_amount) * 100
+    
+    print(f"--- 🏁 検証結果 (テストデータ {total_races}レース分) ---")
+    print(f"🎯 的中率 (単勝1点買い): {accuracy:.2f}%")
+    print(f"💰 回収率 (単勝1点買い): {recovery_rate:.2f}%")
+    print(f"--------------------------------------------------")
+
+    # 最後に全データで再学習（本番予想用）
+    print("🔄 本番用に全データで再学習しています...")
+    calibrated_model.fit(X, y)
+
+print("✅ 学習完了！")
+
 # ------------------------------------------------
 # 2. 最新オッズでの予想 (過去3走評価)
 # ------------------------------------------------
