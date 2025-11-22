@@ -195,12 +195,20 @@ else:
 # 3. 予想パート (特徴量追加版)
 # ------------------------------------------------
 print(f"\n🚀 出馬表({entry_file})で予想します...")
-if not os.path.exists(entry_file): sys.exit(1)
+if not os.path.exists(entry_file): 
+    print(f"❌ エラー: ファイルが見つかりません: {entry_file}")
+    sys.exit(1)
 
 try:
+    # まずUTF-8で試す
     df_entry = pd.read_csv(entry_file, encoding='utf-8-sig')
 except:
-    df_entry = pd.read_csv(entry_file, encoding='cp932', errors='replace')
+    try:
+        # だめならCP932（Shift-JIS拡張）で試す
+        df_entry = pd.read_csv(entry_file, encoding='cp932')
+    except:
+        # それでもだめならShift-JISで試す
+        df_entry = pd.read_csv(entry_file, encoding='shift_jis')
 
 df_entry.columns = df_entry.columns.str.strip()
 df_pred = df_entry.copy()
