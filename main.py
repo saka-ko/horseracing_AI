@@ -1,5 +1,5 @@
 # ==========================================
-# 🏇 競馬AI (ZI & 補正タイム & オッズ断層) - 検証強化版
+# 🏇 競馬AI (ZI & 断層理論) - 決定版
 # ==========================================
 import pandas as pd
 import numpy as np
@@ -7,7 +7,7 @@ import lightgbm as lgb
 import sys
 import os
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 # ------------------------------------------------
 # 0. 設定
@@ -15,12 +15,11 @@ from sklearn.model_selection import train_test_split
 train_file = 'race_5years_zi_hoseitime_kai.csv' 
 entry_file = 'entry_table.csv'      
 
-# コマンドライン引数対応
 if len(sys.argv) > 1 and sys.argv[1].endswith('.csv'):
     entry_file = sys.argv[1]
 
 # ------------------------------------------------
-# 1. 学習データの読み込み & クリーニング
+# 1. 学習データの読み込み
 # ------------------------------------------------
 print(f"🔄 学習データ({train_file})を読み込んでいます...")
 
@@ -88,16 +87,21 @@ X = df_train[features]
 y = df_train['target']
 
 # ------------------------------------------------
-# 2. モデル検証（オッズ断層シミュレーション付き）
+# 2. モデル検証（正しい分割方法）
 # ------------------------------------------------
-print("\n📊 モデルと『オッズ断層理論』の検証中（データを8:2に分割）...")
+print("\n📊 モデル検証中（レース単位で正しく分割）...")
 
-# データを分割
-X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+# ★重要: レースID単位で分割する（バラバラ殺人を防ぐ）
+gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+train_idx, val_idx = next(gss.split(X, y, groups=df_train['rid_group']))
 
-# 検証用データフレームを作成
-df_val_sim = df_train.loc[X_val.index].copy()
-df_val_sim['target'] = y_val
+X_train = X.iloc[train_idx]
+y_train = y.iloc[train_idx]
+X_val = X.iloc[val_idx]
+y_val = y.iloc[val_idx]
+
+# 検証用DF
+df_val_sim = df_train.iloc[val_idx].copy()
 
 # 学習
 model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
@@ -107,50 +111,56 @@ calibrated_model.fit(X_train, y_train)
 # 予測
 probs = calibrated_model.predict_proba(X_val)[:, 1]
 df_val_sim['prob'] = probs
-# 期待値 = 勝率 * オッズ
 df_val_sim['expected_value'] = df_val_sim['prob'] * df_val_sim['単勝オッズ']
 
-# --- 🦁 オッズ断層の計算 (高速化のためベクトル処理) ---
-# レースIDとオッズでソート
+# --- 🦁 オッズ断層の計算 ---
 df_val_sim = df_val_sim.sort_values(by=['rid_group', '単勝オッズ'])
-
-# 次の馬のオッズを取得 (同じレースID内のみ)
 df_val_sim['next_odds'] = df_val_sim.groupby('rid_group')['単勝オッズ'].shift(-1)
-# 断層値を計算 (次のオッズ / 自分のオッズ)
 df_val_sim['gap_next'] = df_val_sim['next_odds'] / df_val_sim['単勝オッズ']
-# NaN埋め (一番人気の馬など)
 df_val_sim['gap_next'] = df_val_sim['gap_next'].fillna(1.0)
 
 # === 🧪 シミュレーション条件 ===
-# 条件A: AI推奨のみ (期待値 > 1.0)
-cond_ai = df_val_sim['expected_value'] >= 1.0
+# 1. ベースライン: ZI指数1位を買い続ける
+cond_zi = df_val_sim['指数順位'] == 1
 
-# 条件B: AI推奨 + 断層理論
-# 「期待値 > 1.0」かつ「直後に1.5倍以上の断層がある (＝自分は過小評価の崖っぷちにいる)」
-cond_gap = (df_val_sim['expected_value'] >= 1.0) & (df_val_sim['gap_next'] >= 1.5)
+# 2. AI本命: AIの確率が最も高い馬を買う (これが真の実力)
+# 各レースでprobが最大の行にフラグを立てる
+idx_max_prob = df_val_sim.groupby('rid_group')['prob'].idxmax()
+cond_ai_top = df_val_sim.index.isin(idx_max_prob)
 
-# 集計関数
+# 3. AI期待値 + 確率フィルター (大穴事故防止)
+# 期待値100円以上、かつ勝率が10%以上ある現実的な馬
+cond_ai_ev = (df_val_sim['expected_value'] >= 1.0) & (df_val_sim['prob'] >= 0.10)
+
+# 4. 断層理論 (勝率10%以上 + 期待値100円 + 後ろに断層)
+cond_gap = (df_val_sim['expected_value'] >= 1.0) & \
+           (df_val_sim['prob'] >= 0.10) & \
+           (df_val_sim['gap_next'] >= 1.5)
+
 def report_sim(name, condition):
     picks = df_val_sim[condition]
     if len(picks) == 0:
-        print(f"  [{name}] 該当馬なし")
+        print(f"  [{name}] 該当なし")
         return
-    
     hits = picks[picks['target'] == 1]
     accuracy = len(hits) / len(picks) * 100
     return_rate = hits['単勝オッズ'].sum() / len(picks) * 100
+    avg_odds = picks['単勝オッズ'].mean()
     print(f"  [{name}]")
-    print(f"    購入レース数: {len(picks)}R")
+    print(f"    購入: {len(picks)}R / 平均オッズ: {avg_odds:.1f}倍")
     print(f"    🎯 的中率: {accuracy:.2f}%")
     print(f"    💰 回収率: {return_rate:.2f}%")
 
 print(f"--- 🏁 検証結果 (テスト期間のシミュレーション) ---")
-report_sim("プランA: 単純AI推奨 (期待値100円以上)", cond_ai)
+report_sim("ベースライン: ZI順位1位ベタ買い", cond_zi)
 print("-" * 40)
-report_sim("プランB: AI推奨 + オッズ断層あり (直後断層1.5倍以上)", cond_gap)
+report_sim("プランA: AI自信度No.1 (本命・対抗)", cond_ai_top)
+report_sim("プランB: AI期待値狙い (勝率10%以上限定)", cond_ai_ev)
+print("-" * 40)
+report_sim("プランC: AI + オッズ断層 (勝負レース)", cond_gap)
 print(f"--------------------------------------------------")
 
-# 本番用に全データで再学習
+# 本番再学習
 print("🔄 本番用に全データで再学習しています...")
 calibrated_model.fit(X, y)
 print("✅ 学習完了！")
@@ -159,7 +169,7 @@ print("✅ 学習完了！")
 # 3. 最新オッズでの予想 (断層診断機能付き)
 # ------------------------------------------------
 print(f"\n🚀 出馬表({entry_file})で予想します...")
-
+# (以下、予想パートは変更なしのためそのまま使えます)
 if not os.path.exists(entry_file):
     print(f"❌ エラー: 予想用ファイル({entry_file})が見つかりません。")
     sys.exit(1)
@@ -227,9 +237,7 @@ def make_comment(row):
     return ",".join(res) if res else "-"
 df_pred['診断'] = df_pred.apply(make_comment, axis=1)
 
-# ---------------------------------------------------------
-# 4. オッズ断層による「レース波乱度」診断機能
-# ---------------------------------------------------------
+# オッズ断層分析
 def analyze_odds_gap(df_race):
     df_sorted = df_race[df_race['単勝オッズ'] > 0].sort_values('単勝オッズ')
     if len(df_sorted) < 6: return "⚠️ データ不足", []
@@ -238,14 +246,12 @@ def analyze_odds_gap(df_race):
     gaps = odds[1:] / odds[:-1]
     
     diagnosis = []
-    target_horse_indices = [] # リストのindexに対応
+    target_horse_indices = [] 
 
-    # 1. 1-2人気断層
     if gaps[0] >= 2.5: diagnosis.append(f"🦁 1番人気鉄板(断層{gaps[0]:.1f})")
     elif gaps[0] < 1.5: diagnosis.append(f"⚠️ 1番人気危険(断層{gaps[0]:.1f})")
 
-    # 2. 3-6人気の中穴断層
-    middle_gaps = gaps[1:5] # 2-3, 3-4, 4-5, 5-6の間
+    middle_gaps = gaps[1:5] 
     if len(middle_gaps) > 0:
         max_gap_idx = np.argmax(middle_gaps) + 1 
         max_gap_val = middle_gaps[np.argmax(middle_gaps)]
@@ -260,13 +266,10 @@ def analyze_odds_gap(df_race):
 
     return " / ".join(diagnosis), df_sorted.iloc[target_horse_indices][name_col].tolist()
 
-# --- 結果出力 ---
 cols_out = ['枠番', '馬番', name_col, '単勝オッズ', 'AI勝率(%)', '期待値', '診断', '指数', '前走補正']
 disp_cols = [c for c in cols_out if c in df_pred.columns]
 
 print("\n=== 📊 オッズ断層分析 (マーケット心理) ===")
-# レースごとに分析（今回はファイル全体を1レースとみなすか、レース名でループするか）
-# 簡易的に「ファイル全体＝1レース」として診断します
 gap_msg, gap_targets = analyze_odds_gap(df_pred)
 print(f"💬 {gap_msg}")
 if gap_targets:
@@ -274,6 +277,3 @@ if gap_targets:
 
 print("\n=== 💰 期待値ランキング ===")
 print(df_pred[df_pred['単勝オッズ'] >= 1.0].sort_values('期待値', ascending=False)[disp_cols].head(15))
-
-if len(gap_targets) > 0:
-    print("\n💡 ヒント: 『断層理論の注目馬』と『AI期待値上位(★推奨)』が重なれば、最大の勝負所です！")
