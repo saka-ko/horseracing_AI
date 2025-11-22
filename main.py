@@ -1,5 +1,5 @@
 # ==========================================
-# 🏇 競馬AI (ZI & 補正タイム特化型) - 修復版
+# 🏇 競馬AI (ZI & 補正タイム特化型) - 完結編
 # ==========================================
 import pandas as pd
 import numpy as np
@@ -17,49 +17,49 @@ entry_file = 'entry_table.csv'
 # ------------------------------------------------
 print(f"🔄 学習データ({train_file})を読み込んでいます...")
 
-# 読み込みトライアル (文字コード対策)
+# 読み込みトライアル (encodingエラー対策)
 df_train = None
-encodings = ['cp932', 'shift_jis', 'utf-8-sig', 'utf-8'] # TARGETはcp932が多い
+encodings = ['utf-8-sig', 'cp932', 'shift_jis', 'utf-8'] 
 
 for enc in encodings:
     try:
+        # errors引数は削除しました
         df = pd.read_csv(train_file, encoding=enc, low_memory=False)
-        # 読めたら列名チェック
+        # 列名のクリーニング
+        df.columns = df.columns.str.strip()
+        
+        # 必須列があるかチェック
         if any('着順' in col for col in df.columns) or any('ZI' in col for col in df.columns):
             df_train = df
-            print(f"✅ {enc} で読み込み成功")
+            print(f"✅ {enc} で読み込み成功 (列数: {len(df.columns)})")
             break
-    except:
+    except Exception as e:
         continue
 
 if df_train is None:
-    # 最終手段：エラー無視で読み込む
-    df_train = pd.read_csv(train_file, encoding='shift_jis', errors='ignore', low_memory=False)
-    print("⚠️ 強制読み込みを行いました（文字化けの可能性があります）")
+    print("❌ エラー: ファイルが読み込めませんでした。ファイル名や形式を確認してください。")
+    raise ValueError("File reading failed.")
 
-# 列名のクリーニング
-df_train.columns = df_train.columns.str.strip()
+# 重複列の削除
 df_train = df_train.loc[:, ~df_train.columns.duplicated()]
 
 # ------------------------------------------------------
-# 🚑 列名救済措置 (ここが修正ポイント！)
+# 🚑 列名救済措置 (着順が見つからない場合)
 # ------------------------------------------------------
-# 「着順」が見つからない場合、「確定着順」などを探してリネームする
-rank_col = None
-if '着順' in df_train.columns:
-    rank_col = '着順'
-else:
-    # '着順'を含む列を探す
-    cands = [c for c in df_train.columns if '着順' in c]
-    if cands:
-        rank_col = cands[0]
-        print(f"ℹ️ '{rank_col}' を '着順' として扱います")
-        df_train.rename(columns={rank_col: '着順'}, inplace=True)
+# 「着順」という名前の列を探す
+rank_cols = [c for c in df_train.columns if '着順' in c]
+if '着順' not in df_train.columns and rank_cols:
+    print(f"ℹ️ '{rank_cols[0]}' を '着順' として扱います")
+    df_train.rename(columns={rank_cols[0]: '着順'}, inplace=True)
 
-if '着順' not in df_train.columns:
-    print("❌ エラー: 学習データに『着順』列が見つかりません。")
-    print("現在の列名:", df_train.columns.tolist()[:10]) # 先頭10個だけ表示
-    raise ValueError("学習データを確認してください。")
+# 「前走補正」が見つからない場合
+if '前走補正' not in df_train.columns:
+    if '補正タイム.1' in df_train.columns: df_train['前走補正'] = df_train['補正タイム.1']
+    elif '補正9' in df_train.columns: df_train['前走補正'] = df_train['補正9'] # TARGET別名
+
+# 「指数」が見つからない場合
+if '指数' not in df_train.columns and 'ZI' in df_train.columns:
+    df_train['指数'] = df_train['ZI']
 
 # 数値化関数
 def force_numeric(x):
@@ -71,18 +71,13 @@ def force_numeric(x):
     except: return np.nan
 
 # ターゲット作成
-df_train['着順_num'] = df_train['着順'].apply(force_numeric)
-df_train = df_train.dropna(subset=['着順_num'])
-df_train['target'] = (df_train['着順_num'] == 1).astype(int)
-
-# 特徴量作成（シンプル特化）
-# 必須列の確保
-if '前走補正' not in df_train.columns:
-    if '補正タイム.1' in df_train.columns: df_train['前走補正'] = df_train['補正タイム.1']
-    elif '補正9' in df_train.columns: df_train['前走補正'] = df_train['補正9'] # TARGETの別名
-
-if '指数' not in df_train.columns and 'ZI' in df_train.columns:
-    df_train['指数'] = df_train['ZI']
+if '着順' in df_train.columns:
+    df_train['着順_num'] = df_train['着順'].apply(force_numeric)
+    df_train = df_train.dropna(subset=['着順_num'])
+    df_train['target'] = (df_train['着順_num'] == 1).astype(int)
+else:
+    print("❌ エラー: 『着順』列が見つかりません。列名を確認してください:", df_train.columns.tolist()[:10])
+    raise ValueError("Target column missing.")
 
 # 数値化 & 欠損埋め
 for f in ['指数', '前走補正']:
@@ -91,8 +86,13 @@ for f in ['指数', '前走補正']:
     else:
         df_train[f] = 0
 
-# ランク計算 (相対評価)
+# ランク計算
 race_id_col = 'レースID(新)' if 'レースID(新)' in df_train.columns else 'レースID'
+# IDがない場合、とりあえず日付と場所で作る
+if race_id_col not in df_train.columns and '日付' in df_train.columns and '場所' in df_train.columns:
+    df_train['レースID'] = df_train['日付'].astype(str) + df_train['場所'].astype(str)
+    race_id_col = 'レースID'
+
 if race_id_col in df_train.columns:
     df_train['指数順位'] = df_train.groupby(race_id_col)['指数'].rank(ascending=False, method='min')
     df_train['補正順位'] = df_train.groupby(race_id_col)['前走補正'].rank(ascending=False, method='min')
@@ -123,7 +123,7 @@ except:
     try:
         df_entry = pd.read_csv(entry_file, encoding='cp932')
     except:
-        df_entry = pd.read_csv(entry_file, encoding='shift_jis', errors='replace')
+        df_entry = pd.read_csv(entry_file, encoding='shift_jis', errors='replace') # errors引数はこっちはOK(decode用)
 
 # 列名クリーニング
 df_entry.columns = df_entry.columns.str.strip()
@@ -148,7 +148,12 @@ for f in ['指数', '前走補正', '単勝オッズ']:
         df_pred[f] = 0
 
 # ランク計算
-race_key = 'レース名' if 'レース名' in df_pred.columns else '開催'
+# レース名がない場合、すべて同じレースとみなして順位をつける
+race_key = 'レース名' 
+if race_key not in df_pred.columns:
+    df_pred['dummy_race'] = 1
+    race_key = 'dummy_race'
+
 df_pred['指数順位'] = df_pred.groupby(race_key)['指数'].rank(ascending=False, method='min')
 df_pred['補正順位'] = df_pred.groupby(race_key)['前走補正'].rank(ascending=False, method='min')
 
