@@ -1,17 +1,51 @@
 # ==========================================
-# 🏇 競馬AI (過去3走Max評価 & 勝率表示版)
+# 🏇 競馬AI (ZI & 補正タイム特化型) - Final
 # ==========================================
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
 import re
-from sklearn.model_selection import train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelEncoder
 
 # ファイル設定
-train_file = 'race_5years_zi_hoseitime_kai.csv'
+train_file = 'race_5years_zi_hoseitime_kai.csv' # 5年分データ
 entry_file = 'entry_table.csv'
+
+# ------------------------------------------------
+# 1. 学習データの読み込み & クリーニング
+# ------------------------------------------------
+print(f"🔄 学習データ({train_file})を読み込んでいます...")
+
+# 読み込みトライアル
+df_train = None
+encodings = ['utf-8-sig', 'cp932', 'shift_jis', 'utf-8'] 
+
+for enc in encodings:
+    try:
+        df = pd.read_csv(train_file, encoding=enc, low_memory=False)
+        df.columns = df.columns.str.strip()
+        # 必須列があるかチェック
+        if any('着順' in col for col in df.columns) or any('ZI' in col for col in df.columns):
+            df_train = df
+            print(f"✅ {enc} で読み込み成功")
+            break
+    except:
+        continue
+
+if df_train is None:
+    raise ValueError("❌ 学習データを読み込めませんでした。ファイル名を確認してください。")
+
+# 重複列の削除
+df_train = df_train.loc[:, ~df_train.columns.duplicated()]
+
+# 列名救済措置
+rank_col = None
+if '着順' in df_train.columns: rank_col = '着順'
+elif '確定着順' in df_train.columns: rank_col = '確定着順'
+
+if not rank_col:
+    raise ValueError("❌ 学習データに『着順』列が見つかりません。")
 
 # 数値化関数
 def force_numeric(x):
@@ -22,64 +56,27 @@ def force_numeric(x):
         return float(clean_str)
     except: return np.nan
 
-# ------------------------------------------------
-# 1. 学習データの読み込み & 特徴量エンジニアリング
-# ------------------------------------------------
-print(f"🔄 学習データ({train_file})を読み込んでいます...")
-
-# 読み込み
-try:
-    df_train = pd.read_csv(train_file, encoding='utf-8-sig', low_memory=False)
-except:
-    try:
-        df_train = pd.read_csv(train_file, encoding='cp932', low_memory=False)
-    except:
-        df_train = pd.read_csv(train_file, encoding='shift_jis', errors='ignore', low_memory=False)
-
-# 列名クリーニング
-df_train.columns = df_train.columns.str.strip()
-df_train = df_train.loc[:, ~df_train.columns.duplicated()]
-
-# 着順の確保
-if '着順' not in df_train.columns and '確定着順' in df_train.columns:
-    df_train['着順'] = df_train['確定着順']
-
-df_train['着順_num'] = df_train['着順'].apply(force_numeric)
+# ターゲット作成
+df_train['着順_num'] = df_train[rank_col].apply(force_numeric)
 df_train = df_train.dropna(subset=['着順_num'])
 df_train['target'] = (df_train['着順_num'] == 1).astype(int)
 
-# --- ★重要: 過去3走の最大補正タイムを計算 ---
-print("📊 過去5年分のレース履歴から、各馬の『過去3走MAX補正』を算出中...")
+# 特徴量作成
+# 学習時は「前走」のデータだけを使う
+if '前走補正' not in df_train.columns:
+    if '前走補9' in df_train.columns: df_train['前走補正'] = df_train['前走補9']
+    elif '補9' in df_train.columns: df_train['前走補正'] = df_train['補9']
+    else: df_train['前走補正'] = 0
 
-# 日付順に並べる
-if '日付(yyyy.mm.dd)' in df_train.columns:
-    df_train['date'] = pd.to_datetime(df_train['日付(yyyy.mm.dd)'], errors='coerce')
-else:
-    # 日付がない場合は並び順を信じるしかないが、通常はあるはず
-    df_train['date'] = df_train.index
-
-# 補正タイムを数値化
-if '補正' in df_train.columns:
-    df_train['補正_val'] = df_train['補正'].apply(force_numeric).fillna(0)
-else:
-    df_train['補正_val'] = 0
-
-# 馬名と日付でソート
-df_train = df_train.sort_values(['馬名', 'date'])
-
-# 過去3走の最大値を取得 (シフトして過去を参照)
-# shift(1)で「今回」を含めないようにし、rolling(3)で過去3つを見る
-df_train['過去3走MAX補正'] = df_train.groupby('馬名')['補正_val'].transform(
-    lambda x: x.shift(1).rolling(window=3, min_periods=1).max()
-).fillna(0)
-
-# 指数 (ZI)
 if '指数' not in df_train.columns:
     if 'ZI' in df_train.columns: df_train['指数'] = df_train['ZI']
     else: df_train['指数'] = 0
-df_train['指数'] = df_train['指数'].apply(force_numeric).fillna(0)
 
-# ランク計算
+# 数値化 & 欠損埋め
+for f in ['指数', '前走補正']:
+    df_train[f] = df_train[f].apply(force_numeric).fillna(0)
+
+# ランク計算 (レース内順位)
 race_id_col = 'レースID(新)' if 'レースID(新)' in df_train.columns else 'レースID'
 if race_id_col not in df_train.columns:
     # IDがない場合は日付と場所で代用
@@ -91,26 +88,25 @@ if race_id_col not in df_train.columns:
 
 if race_id_col:
     df_train['指数順位'] = df_train.groupby(race_id_col)['指数'].rank(ascending=False, method='min')
-    # 過去3走MAXでの順位を計算
-    df_train['補正順位'] = df_train.groupby(race_id_col)['過去3走MAX補正'].rank(ascending=False, method='min')
+    df_train['補正順位'] = df_train.groupby(race_id_col)['前走補正'].rank(ascending=False, method='min')
 else:
     df_train['指数順位'] = 10; df_train['補正順位'] = 10
 
-# 特徴量リスト
-features = ['指数', '過去3走MAX補正', '指数順位', '補正順位']
+# 使用する特徴量
+features = ['指数', '前走補正', '指数順位', '補正順位']
 
-# 学習実行
-print("🔥 過去3走評価モデルを学習中...")
+print("🔥 ZI & 補正タイム特化モデルを学習中...")
 X = df_train[features]
 y = df_train['target']
 
+# モデル学習
 model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
 calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
 calibrated_model.fit(X, y)
 print("✅ 学習完了！")
 
 # ------------------------------------------------
-# 2. 最新オッズでの予想 (出馬表の処理)
+# 2. 最新オッズでの予想 (過去3走評価)
 # ------------------------------------------------
 print(f"🚀 最新の出馬表({entry_file})で予想します...")
 
@@ -122,81 +118,107 @@ except:
     except:
         df_entry = pd.read_csv(entry_file, encoding='shift_jis', errors='replace')
 
+# 列名クリーニング
 df_entry.columns = df_entry.columns.str.strip()
 df_entry = df_entry.loc[:, ~df_entry.columns.duplicated()]
 df_pred = df_entry.copy()
 
-# --- ★出馬表から過去3走のMAX補正を取得 ---
-# 出馬表の列名 (補:1, 補:2, 補:3) を探す
-hosei_cols = ['補:1', '補:2', '補:3']
-target_hosei_cols = []
+# --- ★重要: 過去3走から最大補正タイムを取得 ---
+# 列名を探す (補:1, 補:2, 補:3 または 補正タイム.1, 補正タイム.2...)
+hosei_cols = []
+for i in range(1, 4):
+    c1 = f'補:{i}'
+    c2 = f'補正タイム.{i}'
+    if c1 in df_pred.columns: hosei_cols.append(c1)
+    elif c2 in df_pred.columns: hosei_cols.append(c2)
 
-# 実際に存在する列だけ使う (補正タイム.1 などの場合も対応)
-for c in hosei_cols:
-    if c in df_pred.columns: target_hosei_cols.append(c)
-if not target_hosei_cols:
-    # 別名で探す
-    for i in range(1, 4):
-        c = f'補正タイム.{i}'
-        if c in df_pred.columns: target_hosei_cols.append(c)
+# 「補正タイム」自体も候補に入れる（TARGETの仕様により1走前の場合がある）
+if '補正タイム' in df_pred.columns:
+    hosei_cols.append('補正タイム')
 
-print(f"ℹ️ 参照する過去走データ: {target_hosei_cols}")
+print(f"ℹ️ 参照する過去走データ: {list(set(hosei_cols))}")
 
-# 最大値を計算
-def get_entry_max_hosei(row):
+def get_max_hosei(row):
     vals = []
-    for c in target_hosei_cols:
+    for c in hosei_cols:
         v = force_numeric(row[c])
         if v > 0: vals.append(v)
     return max(vals) if vals else 0
 
-df_pred['過去3走MAX補正'] = df_pred.apply(get_entry_max_hosei, axis=1)
+# 最大値を「前走補正」として扱う
+df_pred['前走補正'] = df_pred.apply(get_max_hosei, axis=1)
 
-# その他のマッピング
+# 指数 (ZI)
 if 'ZI' in df_pred.columns: df_pred['指数'] = df_pred['ZI'].apply(force_numeric).fillna(0)
 else: df_pred['指数'] = 0
 
 # 単勝オッズ
-odds_col = '単勝' if '単勝' in df_pred.columns else '単勝オッズ'
-if odds_col in df_pred.columns:
+odds_col = None
+for c in ['単勝', '単勝オッズ', '予想単勝オッズ']:
+    if c in df_pred.columns:
+        odds_col = c
+        break
+if odds_col:
     df_pred['単勝オッズ'] = df_pred[odds_col].apply(force_numeric).fillna(0)
 else:
     df_pred['単勝オッズ'] = 0
 
 # ランク計算
-race_key = 'レース名' if 'レース名' in df_pred.columns else '開催'
-if race_key not in df_pred.columns: df_pred['dummy']=1; race_key='dummy'
+# レース名がない場合、すべて同じレースとみなして順位をつける
+race_key = 'レース名' 
+if race_key not in df_pred.columns:
+    df_pred['dummy'] = 1
+    race_key = 'dummy'
 
 df_pred['指数順位'] = df_pred.groupby(race_key)['指数'].rank(ascending=False, method='min')
-df_pred['補正順位'] = df_pred.groupby(race_key)['過去3走MAX補正'].rank(ascending=False, method='min')
+df_pred['補正順位'] = df_pred.groupby(race_key)['前走補正'].rank(ascending=False, method='min')
 
-# 予測
+# 予測実行
 X_pred = df_pred[features]
-probs = calibrated_model.predict_proba(X_pred)[:, 1]
-df_pred['AI勝率(%)'] = (probs * 100).round(2)
-df_pred['期待値'] = (df_pred['AI勝率(%)'] / 100) * df_pred['単勝オッズ']
+raw_probs = calibrated_model.predict_proba(X_pred)[:, 1]
 
-# 馬名
-name_col = [c for c in df_pred.columns if '馬名' in c]
-name_c = name_col[0] if name_col else 'Unknown'
+# ★確率の正規化（合計を100%にする）
+total_prob = raw_probs.sum()
+if total_prob > 0:
+    normalized_probs = raw_probs / total_prob
+else:
+    normalized_probs = raw_probs
 
-# 診断
+df_pred['AI勝率(%)'] = (normalized_probs * 100).round(2)
+df_pred['期待値'] = (normalized_probs * df_pred['単勝オッズ'])
+
+# 馬名取得
+name_col = '馬名'
+if '馬名' not in df_pred.columns:
+    cands = [c for c in df_pred.columns if '馬名' in c]
+    if cands: name_col = cands[0]
+
+# 診断コメント
 def make_comment(row):
     res = []
     if row['指数順位'] == 1: res.append("指数1位")
     if row['補正順位'] == 1: res.append("能力1位")
     elif row['補正順位'] <= 3: res.append("能力上位")
-    if row['期待値'] >= 1.2: res.append("★狙い目")
+    if row['期待値'] >= 1.0: res.append("★推奨")
     return ",".join(res) if res else "-"
 
 df_pred['診断'] = df_pred.apply(make_comment, axis=1)
 
-# --- 結果出力 ---
-cols_out = ['枠番', '馬番', name_c, '単勝オッズ', 'AI勝率(%)', '期待値', '診断', '指数', '過去3走MAX補正']
-disp_cols = [c for c in cols_out if c in df_pred.columns]
+# --- 結果表示 ---
+cols = ['枠番', '馬番', name_col, '単勝オッズ', 'AI勝率(%)', '期待値', '診断', '指数', '前走補正']
+disp_cols = [c for c in cols if c in df_pred.columns]
 
-print("\n=== 💰 期待値ランキング (回収率重視) ===")
-print(df_pred.sort_values('期待値', ascending=False)[disp_cols].head(15))
+# 1. 勝率ランキング
+print("\n=== 🏅 推奨馬リスト (勝率順・的中率重視) ===")
+final_list_prob = df_pred.sort_values('AI勝率(%)', ascending=False)
+print(final_list_prob[disp_cols].head(15))
 
-print("\n=== 🏅 AI勝率ランキング (的中率重視) ===")
-print(df_pred.sort_values('AI勝率(%)', ascending=False)[disp_cols].head(15))
+# 2. 期待値ランキング
+print("\n=== 💰 推奨馬リスト (期待値順・回収率重視) ===")
+# オッズ1.0倍以上でソート
+final_list_ev = df_pred[df_pred['単勝オッズ'] >= 1.0].sort_values('期待値', ascending=False)
+print(final_list_ev[disp_cols].head(15))
+
+if len(final_list_prob) > 0:
+    top = final_list_prob.iloc[0]
+    print(f"\n👑 勝率No.1: {top[name_col]} (勝率 {top['AI勝率(%)']}%)")
