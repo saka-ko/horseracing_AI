@@ -1,5 +1,5 @@
 # ==========================================
-# 🏇 競馬AI (ZI & 補正タイム特化型) - 完全版
+# 🏇 競馬AI (ZI & 補正タイム & オッズ断層) - 検証強化版
 # ==========================================
 import pandas as pd
 import numpy as np
@@ -12,15 +12,15 @@ from sklearn.model_selection import train_test_split
 # ------------------------------------------------
 # 0. 設定
 # ------------------------------------------------
-train_file = 'race_5years_zi_hoseitime_kai.csv' # いただいたファイル
-entry_file = 'entry_table.csv'      # 予想用ファイル
+train_file = 'race_5years_zi_hoseitime_kai.csv' 
+entry_file = 'entry_table.csv'      
 
 # コマンドライン引数対応
 if len(sys.argv) > 1 and sys.argv[1].endswith('.csv'):
     entry_file = sys.argv[1]
 
 # ------------------------------------------------
-# 1. 学習データの読み込み（改良版）
+# 1. 学習データの読み込み & クリーニング
 # ------------------------------------------------
 print(f"🔄 学習データ({train_file})を読み込んでいます...")
 
@@ -31,15 +31,13 @@ except:
 
 df_train.columns = df_train.columns.str.strip()
 
-# --- ★列名の自動マッピング ---
+# --- 列名マッピング ---
 col_map = {}
-# 必須列のエイリアス（別名）定義
 aliases = {
     '着順': ['確定着順', '着順'],
     'ZI': ['指数', 'ZI', 'ZI値'],
     'オッズ': ['単勝オッズ', '単勝', '確定単勝オッズ'],
     'レースID': ['レースID(新)', 'レースID(旧)', 'レースID'],
-    # 重要: ここで「前走」のデータだけを選ぶ
     '前走補正': ['前走補9', '前走補正', '前走タイム'] 
 }
 
@@ -49,19 +47,15 @@ for key, candidates in aliases.items():
             col_map[key] = cand
             break
 
-# 必須チェック
 if '着順' not in col_map or 'ZI' not in col_map:
     print(f"❌ エラー: 必要な列が見つかりません。現在の列名: {list(df_train.columns)}")
     sys.exit(1)
-
-print("✅ データを正しく認識しました！")
 
 # 数値化関数
 def force_numeric(x):
     if pd.isna(x): return np.nan
     try:
         import re
-        # 全角→半角, 数字以外削除
         x_str = str(x).translate(str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)}))
         clean_str = re.sub(r'[^\d.-]', '', x_str)
         return float(clean_str)
@@ -72,20 +66,15 @@ df_train['target'] = (df_train[col_map['着順']].apply(force_numeric) == 1).ast
 df_train['指数'] = df_train[col_map['ZI']].apply(force_numeric).fillna(0)
 df_train['単勝オッズ'] = df_train[col_map['オッズ']].apply(force_numeric).fillna(0)
 
-# 補正タイム（前走データのみ使用）
 if '前走補正' in col_map:
     df_train['前走補正'] = df_train[col_map['前走補正']].apply(force_numeric).fillna(0)
 else:
-    # なければ0で埋める（エラーにしない）
     df_train['前走補正'] = 0
 
-# --- 🚨 レースIDの修正（18桁問題対策） ---
-# レースIDが長すぎる（馬番込み）場合は、末尾2桁をカットしてグルーピングする
+# レースID修正（馬番カット）
 rid_col = col_map['レースID']
 df_train['rid_str'] = df_train[rid_col].astype(str)
-# 簡易判定: 平均頭数が5頭以下ならIDが細かすぎると判断
 if len(df_train) / df_train['rid_str'].nunique() < 5.0:
-    print("ℹ️ レースIDを補正します（馬番を除去してグループ化）")
     df_train['rid_group'] = df_train['rid_str'].str[:-2]
 else:
     df_train['rid_group'] = df_train['rid_str']
@@ -99,47 +88,77 @@ X = df_train[features]
 y = df_train['target']
 
 # ------------------------------------------------
-# 2. モデル検証 & 学習
+# 2. モデル検証（オッズ断層シミュレーション付き）
 # ------------------------------------------------
-print("\n📊 モデルの実力を検証中（データを8:2に分割）...")
+print("\n📊 モデルと『オッズ断層理論』の検証中（データを8:2に分割）...")
 
-# 検証用データ分割
+# データを分割
 X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-val_indices = X_val.index
-val_odds = df_train.loc[val_indices, '単勝オッズ']
-val_rids = df_train.loc[val_indices, 'rid_group']
+
+# 検証用データフレームを作成
+df_val_sim = df_train.loc[X_val.index].copy()
+df_val_sim['target'] = y_val
 
 # 学習
 model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
-calibrated = CalibratedClassifierCV(model, method='isotonic', cv=3)
-calibrated.fit(X_train, y_train)
+calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
+calibrated_model.fit(X_train, y_train)
 
-# 検証シミュレーション
-probs_val = calibrated.predict_proba(X_val)[:, 1]
-df_sim = pd.DataFrame({'rid': val_rids, 'target': y_val, 'prob': probs_val, 'odds': val_odds})
+# 予測
+probs = calibrated_model.predict_proba(X_val)[:, 1]
+df_val_sim['prob'] = probs
+# 期待値 = 勝率 * オッズ
+df_val_sim['expected_value'] = df_val_sim['prob'] * df_val_sim['単勝オッズ']
 
-# 各レースで「AI推奨1位」の馬のみ購入
-bets = df_sim.sort_values('prob', ascending=False).groupby('rid').head(1)
-hits = bets[bets['target'] == 1]
+# --- 🦁 オッズ断層の計算 (高速化のためベクトル処理) ---
+# レースIDとオッズでソート
+df_val_sim = df_val_sim.sort_values(by=['rid_group', '単勝オッズ'])
 
-accuracy = (len(hits) / len(bets)) * 100
-recovery = (hits['odds'].sum() / len(bets)) * 100
+# 次の馬のオッズを取得 (同じレースID内のみ)
+df_val_sim['next_odds'] = df_val_sim.groupby('rid_group')['単勝オッズ'].shift(-1)
+# 断層値を計算 (次のオッズ / 自分のオッズ)
+df_val_sim['gap_next'] = df_val_sim['next_odds'] / df_val_sim['単勝オッズ']
+# NaN埋め (一番人気の馬など)
+df_val_sim['gap_next'] = df_val_sim['gap_next'].fillna(1.0)
 
-print(f"--- 🏁 検証結果 (テストデータ {len(bets)}レース) ---")
-print(f"🎯 的中率: {accuracy:.2f}%")
-print(f"💰 回収率: {recovery:.2f}%")
+# === 🧪 シミュレーション条件 ===
+# 条件A: AI推奨のみ (期待値 > 1.0)
+cond_ai = df_val_sim['expected_value'] >= 1.0
+
+# 条件B: AI推奨 + 断層理論
+# 「期待値 > 1.0」かつ「直後に1.5倍以上の断層がある (＝自分は過小評価の崖っぷちにいる)」
+cond_gap = (df_val_sim['expected_value'] >= 1.0) & (df_val_sim['gap_next'] >= 1.5)
+
+# 集計関数
+def report_sim(name, condition):
+    picks = df_val_sim[condition]
+    if len(picks) == 0:
+        print(f"  [{name}] 該当馬なし")
+        return
+    
+    hits = picks[picks['target'] == 1]
+    accuracy = len(hits) / len(picks) * 100
+    return_rate = hits['単勝オッズ'].sum() / len(picks) * 100
+    print(f"  [{name}]")
+    print(f"    購入レース数: {len(picks)}R")
+    print(f"    🎯 的中率: {accuracy:.2f}%")
+    print(f"    💰 回収率: {return_rate:.2f}%")
+
+print(f"--- 🏁 検証結果 (テスト期間のシミュレーション) ---")
+report_sim("プランA: 単純AI推奨 (期待値100円以上)", cond_ai)
+print("-" * 40)
+report_sim("プランB: AI推奨 + オッズ断層あり (直後断層1.5倍以上)", cond_gap)
 print(f"--------------------------------------------------")
 
-# 本番用再学習
+# 本番用に全データで再学習
 print("🔄 本番用に全データで再学習しています...")
-calibrated.fit(X, y)
-print("✅ 学習完了！次のステップ（予想）へ進めます。")
-
+calibrated_model.fit(X, y)
+print("✅ 学習完了！")
 
 # ------------------------------------------------
-# 2. 最新オッズでの予想 (過去3走評価)
+# 3. 最新オッズでの予想 (断層診断機能付き)
 # ------------------------------------------------
-print(f"🚀 出馬表({entry_file})で予想します...")
+print(f"\n🚀 出馬表({entry_file})で予想します...")
 
 if not os.path.exists(entry_file):
     print(f"❌ エラー: 予想用ファイル({entry_file})が見つかりません。")
@@ -153,27 +172,16 @@ except:
     except:
         df_entry = pd.read_csv(entry_file, encoding='shift_jis', errors='replace')
 
-# 列名クリーニング
 df_entry.columns = df_entry.columns.str.strip()
-df_entry = df_entry.loc[:, ~df_entry.columns.duplicated()]
 df_pred = df_entry.copy()
 
-# --- ★重要: 過去3走から最大補正タイムを取得 ---
-# 列名を探す (補:1, 補:2, 補:3 または 補正タイム.1, 補正タイム.2...)
+# 過去3走から最大補正タイムを取得
 hosei_cols = []
 for i in range(1, 4):
-    c1 = f'補:{i}'
-    c2 = f'補正タイム.{i}'
+    c1 = f'補:{i}'; c2 = f'補正タイム.{i}'
     if c1 in df_pred.columns: hosei_cols.append(c1)
     elif c2 in df_pred.columns: hosei_cols.append(c2)
-
-# 「補正タイム」自体も候補に入れる（TARGETの仕様により1走前の場合がある）
-if '補正タイム' in df_pred.columns:
-    hosei_cols.append('補正タイム')
-
-# 重複除去
-hosei_cols = list(set(hosei_cols))
-# print(f"ℹ️ 参照する過去走データ列: {hosei_cols}")
+if '補正タイム' in df_pred.columns: hosei_cols.append('補正タイム')
 
 def get_max_hosei(row):
     vals = []
@@ -182,83 +190,90 @@ def get_max_hosei(row):
         if v > 0: vals.append(v)
     return max(vals) if vals else 0
 
-# 最大値を「前走補正」として扱う
 df_pred['前走補正'] = df_pred.apply(get_max_hosei, axis=1)
 
-# 指数 (ZI)
 if 'ZI' in df_pred.columns: df_pred['指数'] = df_pred['ZI'].apply(force_numeric).fillna(0)
 else: df_pred['指数'] = 0
 
-# 単勝オッズ
-odds_col = None
+odds_col_entry = None
 for c in ['単勝', '単勝オッズ', '予想単勝オッズ']:
-    if c in df_pred.columns:
-        odds_col = c
-        break
-if odds_col:
-    df_pred['単勝オッズ'] = df_pred[odds_col].apply(force_numeric).fillna(0)
-else:
-    df_pred['単勝オッズ'] = 0
+    if c in df_pred.columns: odds_col_entry = c; break
+df_pred['単勝オッズ'] = df_pred[odds_col_entry].apply(force_numeric).fillna(0) if odds_col_entry else 0
 
-# ランク計算
-# レース名がない場合、すべて同じレースとみなして順位をつける
-race_key = 'レース名' 
-if race_key not in df_pred.columns:
-    df_pred['dummy'] = 1
-    race_key = 'dummy'
+race_key = 'レース名' if 'レース名' in df_pred.columns else 'dummy'
+if race_key == 'dummy': df_pred['dummy'] = 1
 
 df_pred['指数順位'] = df_pred.groupby(race_key)['指数'].rank(ascending=False, method='min')
 df_pred['補正順位'] = df_pred.groupby(race_key)['前走補正'].rank(ascending=False, method='min')
 
-# 予測実行
 X_pred = df_pred[features]
 raw_probs = calibrated_model.predict_proba(X_pred)[:, 1]
 
-# ★確率の正規化（合計を100%にする）
 total_prob = raw_probs.sum()
-if total_prob > 0:
-    normalized_probs = raw_probs / total_prob
-else:
-    normalized_probs = raw_probs
+normalized_probs = raw_probs / total_prob if total_prob > 0 else raw_probs
 
 df_pred['AI勝率(%)'] = (normalized_probs * 100).round(2)
 df_pred['期待値'] = (normalized_probs * df_pred['単勝オッズ'])
 
 # 馬名取得
-name_col = '馬名'
-if '馬名' not in df_pred.columns:
-    cands = [c for c in df_pred.columns if '馬名' in c]
-    if cands: name_col = cands[0]
+name_col = '馬名' if '馬名' in df_pred.columns else df_pred.columns[0]
 
 # 診断コメント
 def make_comment(row):
     res = []
     if row['指数順位'] == 1: res.append("指数1位")
     if row['補正順位'] == 1: res.append("能力1位")
-    elif row['補正順位'] <= 3: res.append("能力上位")
     if row['期待値'] >= 1.0: res.append("★推奨")
     return ",".join(res) if res else "-"
-
 df_pred['診断'] = df_pred.apply(make_comment, axis=1)
+
+# ---------------------------------------------------------
+# 4. オッズ断層による「レース波乱度」診断機能
+# ---------------------------------------------------------
+def analyze_odds_gap(df_race):
+    df_sorted = df_race[df_race['単勝オッズ'] > 0].sort_values('単勝オッズ')
+    if len(df_sorted) < 6: return "⚠️ データ不足", []
+
+    odds = df_sorted['単勝オッズ'].values
+    gaps = odds[1:] / odds[:-1]
+    
+    diagnosis = []
+    target_horse_indices = [] # リストのindexに対応
+
+    # 1. 1-2人気断層
+    if gaps[0] >= 2.5: diagnosis.append(f"🦁 1番人気鉄板(断層{gaps[0]:.1f})")
+    elif gaps[0] < 1.5: diagnosis.append(f"⚠️ 1番人気危険(断層{gaps[0]:.1f})")
+
+    # 2. 3-6人気の中穴断層
+    middle_gaps = gaps[1:5] # 2-3, 3-4, 4-5, 5-6の間
+    if len(middle_gaps) > 0:
+        max_gap_idx = np.argmax(middle_gaps) + 1 
+        max_gap_val = middle_gaps[np.argmax(middle_gaps)]
+        if max_gap_val >= 2.0:
+            target_pop = max_gap_idx + 1
+            target_name = df_sorted.iloc[max_gap_idx][name_col]
+            diagnosis.append(f"💰 {target_pop}番人気({target_name})狙い目(後続と断層{max_gap_val:.1f})")
+            target_horse_indices.append(max_gap_idx)
+    
+    if all(g < 1.5 for g in gaps[:5]):
+        diagnosis.append("💤 混戦スルー推奨")
+
+    return " / ".join(diagnosis), df_sorted.iloc[target_horse_indices][name_col].tolist()
 
 # --- 結果出力 ---
 cols_out = ['枠番', '馬番', name_col, '単勝オッズ', 'AI勝率(%)', '期待値', '診断', '指数', '前走補正']
 disp_cols = [c for c in cols_out if c in df_pred.columns]
 
-# 1. 期待値ランキング
-print("\n=== 💰 期待値ランキング (回収率重視) ===")
-print("※『前走補正』欄は、過去3走のベスト数値を表示しています")
-final_list_ev = df_pred[df_pred['単勝オッズ'] >= 1.0].sort_values('期待値', ascending=False)
-print(final_list_ev[disp_cols].head(15))
+print("\n=== 📊 オッズ断層分析 (マーケット心理) ===")
+# レースごとに分析（今回はファイル全体を1レースとみなすか、レース名でループするか）
+# 簡易的に「ファイル全体＝1レース」として診断します
+gap_msg, gap_targets = analyze_odds_gap(df_pred)
+print(f"💬 {gap_msg}")
+if gap_targets:
+    print(f"👉 断層理論の注目馬: {', '.join(gap_targets)}")
 
-# 2. 勝率ランキング
-print("\n=== 🏅 AI勝率ランキング (的中率重視) ===")
-final_list_prob = df_pred.sort_values('AI勝率(%)', ascending=False)
-print(final_list_prob[disp_cols].head(15))
+print("\n=== 💰 期待値ランキング ===")
+print(df_pred[df_pred['単勝オッズ'] >= 1.0].sort_values('期待値', ascending=False)[disp_cols].head(15))
 
-if len(final_list_ev) > 0:
-    top_ev = final_list_ev.iloc[0]
-    print(f"\n💰 期待値No.1: {top_ev[name_col]} (期待値 {top_ev['期待値']:.2f})")
-if len(final_list_prob) > 0:
-    top_prob = final_list_prob.iloc[0]
-    print(f"👑 勝率No.1  : {top_prob[name_col]} (勝率 {top_prob['AI勝率(%)']}%)")
+if len(gap_targets) > 0:
+    print("\n💡 ヒント: 『断層理論の注目馬』と『AI期待値上位(★推奨)』が重なれば、最大の勝負所です！")
