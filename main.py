@@ -1,21 +1,34 @@
 # ==========================================
-# 🏇 競馬AI (ZI & 補正タイム特化型) - Final
+# 🏇 競馬AI (ZI & 補正タイム特化型) - CLI対応版
 # ==========================================
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-import re
+import sys
+import os
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelEncoder
 
-# ファイル設定
-train_file = 'race_5years_zi_hoseitime_kai.csv' # 5年分データ
-entry_file = 'entry_table.csv'
+# ------------------------------------------------
+# 0. 設定とコマンドライン引数の取得
+# ------------------------------------------------
+train_file = 'race_data_5years.csv' # 学習用データ（固定）
+entry_file = 'entry_table.csv'      # デフォルトの予想用ファイル
+
+# コマンドライン引数がある場合は、それを予想ファイルとして使う
+# 使い方: python main.py [ファイル名.csv]
+if len(sys.argv) > 1:
+    # Colabなどのシステム引数(-f など)を除外する簡易チェック
+    if sys.argv[1].endswith('.csv'):
+        entry_file = sys.argv[1]
+
+print(f"📂 学習データ: {train_file}")
+print(f"📂 予想データ: {entry_file}")
 
 # ------------------------------------------------
 # 1. 学習データの読み込み & クリーニング
 # ------------------------------------------------
-print(f"🔄 学習データ({train_file})を読み込んでいます...")
+print(f"🔄 学習データを読み込んでいます...")
 
 # 読み込みトライアル
 df_train = None
@@ -28,13 +41,13 @@ for enc in encodings:
         # 必須列があるかチェック
         if any('着順' in col for col in df.columns) or any('ZI' in col for col in df.columns):
             df_train = df
-            print(f"✅ {enc} で読み込み成功")
             break
     except:
         continue
 
 if df_train is None:
-    raise ValueError("❌ 学習データを読み込めませんでした。ファイル名を確認してください。")
+    print(f"❌ エラー: 学習データ({train_file})が見つかりません。")
+    sys.exit(1) # 終了
 
 # 重複列の削除
 df_train = df_train.loc[:, ~df_train.columns.duplicated()]
@@ -45,13 +58,19 @@ if '着順' in df_train.columns: rank_col = '着順'
 elif '確定着順' in df_train.columns: rank_col = '確定着順'
 
 if not rank_col:
-    raise ValueError("❌ 学習データに『着順』列が見つかりません。")
+    # 着順を含み、数字っぽい列を探す
+    cands = [c for c in df_train.columns if '着順' in c]
+    if cands: rank_col = cands[0]
+    else:
+        print("❌ 学習データに『着順』列が見つかりません。")
+        sys.exit(1)
 
 # 数値化関数
 def force_numeric(x):
     if pd.isna(x): return np.nan
     try:
         x_str = str(x).translate(str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)}))
+        import re
         clean_str = re.sub(r'[^\d.-]', '', x_str)
         return float(clean_str)
     except: return np.nan
@@ -66,6 +85,7 @@ df_train['target'] = (df_train['着順_num'] == 1).astype(int)
 if '前走補正' not in df_train.columns:
     if '前走補9' in df_train.columns: df_train['前走補正'] = df_train['前走補9']
     elif '補9' in df_train.columns: df_train['前走補正'] = df_train['補9']
+    elif '補正タイム.1' in df_train.columns: df_train['前走補正'] = df_train['補正タイム.1']
     else: df_train['前走補正'] = 0
 
 if '指数' not in df_train.columns:
@@ -78,19 +98,17 @@ for f in ['指数', '前走補正']:
 
 # ランク計算 (レース内順位)
 race_id_col = 'レースID(新)' if 'レースID(新)' in df_train.columns else 'レースID'
-if race_id_col not in df_train.columns:
-    # IDがない場合は日付と場所で代用
-    if '日付(yyyy.mm.dd)' in df_train.columns and '場所' in df_train.columns:
-         df_train['rid'] = df_train['日付(yyyy.mm.dd)'].astype(str) + df_train['場所']
-         race_id_col = 'rid'
-    else:
-         race_id_col = None
-
-if race_id_col:
+if race_id_col in df_train.columns:
     df_train['指数順位'] = df_train.groupby(race_id_col)['指数'].rank(ascending=False, method='min')
     df_train['補正順位'] = df_train.groupby(race_id_col)['前走補正'].rank(ascending=False, method='min')
 else:
-    df_train['指数順位'] = 10; df_train['補正順位'] = 10
+    # IDがない場合、日付と場所で仮ID作成
+    if '日付(yyyy.mm.dd)' in df_train.columns and '場所' in df_train.columns:
+         df_train['rid'] = df_train['日付(yyyy.mm.dd)'].astype(str) + df_train['場所']
+         df_train['指数順位'] = df_train.groupby('rid')['指数'].rank(ascending=False, method='min')
+         df_train['補正順位'] = df_train.groupby('rid')['前走補正'].rank(ascending=False, method='min')
+    else:
+         df_train['指数順位'] = 10; df_train['補正順位'] = 10
 
 # 使用する特徴量
 features = ['指数', '前走補正', '指数順位', '補正順位']
@@ -108,7 +126,11 @@ print("✅ 学習完了！")
 # ------------------------------------------------
 # 2. 最新オッズでの予想 (過去3走評価)
 # ------------------------------------------------
-print(f"🚀 最新の出馬表({entry_file})で予想します...")
+print(f"🚀 出馬表({entry_file})で予想します...")
+
+if not os.path.exists(entry_file):
+    print(f"❌ エラー: 予想用ファイル({entry_file})が見つかりません。")
+    sys.exit(1)
 
 try:
     df_entry = pd.read_csv(entry_file, encoding='utf-8-sig')
@@ -136,7 +158,9 @@ for i in range(1, 4):
 if '補正タイム' in df_pred.columns:
     hosei_cols.append('補正タイム')
 
-print(f"ℹ️ 参照する過去走データ: {list(set(hosei_cols))}")
+# 重複除去
+hosei_cols = list(set(hosei_cols))
+# print(f"ℹ️ 参照する過去走データ列: {hosei_cols}")
 
 def get_max_hosei(row):
     vals = []
@@ -204,21 +228,24 @@ def make_comment(row):
 
 df_pred['診断'] = df_pred.apply(make_comment, axis=1)
 
-# --- 結果表示 ---
-cols = ['枠番', '馬番', name_col, '単勝オッズ', 'AI勝率(%)', '期待値', '診断', '指数', '前走補正']
-disp_cols = [c for c in cols if c in df_pred.columns]
+# --- 結果出力 ---
+cols_out = ['枠番', '馬番', name_col, '単勝オッズ', 'AI勝率(%)', '期待値', '診断', '指数', '前走補正']
+disp_cols = [c for c in cols_out if c in df_pred.columns]
 
-# 1. 勝率ランキング
-print("\n=== 🏅 推奨馬リスト (勝率順・的中率重視) ===")
-final_list_prob = df_pred.sort_values('AI勝率(%)', ascending=False)
-print(final_list_prob[disp_cols].head(15))
-
-# 2. 期待値ランキング
-print("\n=== 💰 推奨馬リスト (期待値順・回収率重視) ===")
-# オッズ1.0倍以上でソート
+# 1. 期待値ランキング
+print("\n=== 💰 期待値ランキング (回収率重視) ===")
+print("※『前走補正』欄は、過去3走のベスト数値を表示しています")
 final_list_ev = df_pred[df_pred['単勝オッズ'] >= 1.0].sort_values('期待値', ascending=False)
 print(final_list_ev[disp_cols].head(15))
 
+# 2. 勝率ランキング
+print("\n=== 🏅 AI勝率ランキング (的中率重視) ===")
+final_list_prob = df_pred.sort_values('AI勝率(%)', ascending=False)
+print(final_list_prob[disp_cols].head(15))
+
+if len(final_list_ev) > 0:
+    top_ev = final_list_ev.iloc[0]
+    print(f"\n💰 期待値No.1: {top_ev[name_col]} (期待値 {top_ev['期待値']:.2f})")
 if len(final_list_prob) > 0:
-    top = final_list_prob.iloc[0]
-    print(f"\n👑 勝率No.1: {top[name_col]} (勝率 {top['AI勝率(%)']}%)")
+    top_prob = final_list_prob.iloc[0]
+    print(f"👑 勝率No.1  : {top_prob[name_col]} (勝率 {top_prob['AI勝率(%)']}%)")
