@@ -12,7 +12,7 @@ from sklearn.preprocessing import LabelEncoder
 # ------------------------------------------------
 # 0. 設定とコマンドライン引数の取得
 # ------------------------------------------------
-train_file = 'race_data_5years.csv' # 学習用データ（固定）
+train_file = 'race_5years_zi_hoseitime_kai.csv' # 学習用データ（固定）
 entry_file = 'entry_table.csv'      # デフォルトの予想用ファイル
 
 # コマンドライン引数がある場合は、それを予想ファイルとして使う
