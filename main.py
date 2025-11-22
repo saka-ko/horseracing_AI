@@ -8,7 +8,7 @@ import re
 from sklearn.preprocessing import LabelEncoder
 
 # ファイル設定
-train_file = 'race_data_5years.csv' 
+train_file = 'race_5years_zi_hoseitime_kai.csv' 
 entry_file = 'entry_table.csv'
 
 print(f"🔄 学習データ({train_file})を読み込んでモデルを構築します...")
