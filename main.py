@@ -1,5 +1,5 @@
 # ==========================================
-# 🏇 競馬AI (ZI & 補正タイム特化型) - CLI対応版
+# 🏇 競馬AI (ZI & 補正タイム特化型) - 完全版
 # ==========================================
 import pandas as pd
 import numpy as np
@@ -7,199 +7,134 @@ import lightgbm as lgb
 import sys
 import os
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 
 # ------------------------------------------------
-# 0. 設定とコマンドライン引数の取得
+# 0. 設定
 # ------------------------------------------------
-train_file = 'race_5years_zi_hoseitime_kai.csv' # 学習用データ（固定）
-entry_file = 'entry_table.csv'      # デフォルトの予想用ファイル
+train_file = 'race_5years_zi_hoseitime_kai.csv' # いただいたファイル
+entry_file = 'entry_table.csv'      # 予想用ファイル
 
-# コマンドライン引数がある場合は、それを予想ファイルとして使う
-# 使い方: python main.py [ファイル名.csv]
-if len(sys.argv) > 1:
-    # Colabなどのシステム引数(-f など)を除外する簡易チェック
-    if sys.argv[1].endswith('.csv'):
-        entry_file = sys.argv[1]
-
-print(f"📂 学習データ: {train_file}")
-print(f"📂 予想データ: {entry_file}")
+# コマンドライン引数対応
+if len(sys.argv) > 1 and sys.argv[1].endswith('.csv'):
+    entry_file = sys.argv[1]
 
 # ------------------------------------------------
-# 1. 学習データの読み込み & クリーニング
+# 1. 学習データの読み込み（改良版）
 # ------------------------------------------------
-print(f"🔄 学習データを読み込んでいます...")
+print(f"🔄 学習データ({train_file})を読み込んでいます...")
 
-# 読み込みトライアル
-df_train = None
-encodings = ['utf-8-sig', 'cp932', 'shift_jis', 'utf-8'] 
+try:
+    df_train = pd.read_csv(train_file, encoding='cp932', low_memory=False)
+except:
+    df_train = pd.read_csv(train_file, encoding='utf-8', low_memory=False)
 
-for enc in encodings:
-    try:
-        df = pd.read_csv(train_file, encoding=enc, low_memory=False)
-        df.columns = df.columns.str.strip()
-        # 必須列があるかチェック
-        if any('着順' in col for col in df.columns) or any('ZI' in col for col in df.columns):
-            df_train = df
+df_train.columns = df_train.columns.str.strip()
+
+# --- ★列名の自動マッピング ---
+col_map = {}
+# 必須列のエイリアス（別名）定義
+aliases = {
+    '着順': ['確定着順', '着順'],
+    'ZI': ['指数', 'ZI', 'ZI値'],
+    'オッズ': ['単勝オッズ', '単勝', '確定単勝オッズ'],
+    'レースID': ['レースID(新)', 'レースID(旧)', 'レースID'],
+    # 重要: ここで「前走」のデータだけを選ぶ
+    '前走補正': ['前走補9', '前走補正', '前走タイム'] 
+}
+
+for key, candidates in aliases.items():
+    for cand in candidates:
+        if cand in df_train.columns:
+            col_map[key] = cand
             break
-    except:
-        continue
 
-if df_train is None:
-    print(f"❌ エラー: 学習データ({train_file})が見つかりません。")
-    sys.exit(1) # 終了
+# 必須チェック
+if '着順' not in col_map or 'ZI' not in col_map:
+    print(f"❌ エラー: 必要な列が見つかりません。現在の列名: {list(df_train.columns)}")
+    sys.exit(1)
 
-# 重複列の削除
-df_train = df_train.loc[:, ~df_train.columns.duplicated()]
-
-# 列名救済措置
-rank_col = None
-if '着順' in df_train.columns: rank_col = '着順'
-elif '確定着順' in df_train.columns: rank_col = '確定着順'
-
-if not rank_col:
-    # 着順を含み、数字っぽい列を探す
-    cands = [c for c in df_train.columns if '着順' in c]
-    if cands: rank_col = cands[0]
-    else:
-        print("❌ 学習データに『着順』列が見つかりません。")
-        sys.exit(1)
+print("✅ データを正しく認識しました！")
 
 # 数値化関数
 def force_numeric(x):
     if pd.isna(x): return np.nan
     try:
-        x_str = str(x).translate(str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)}))
         import re
+        # 全角→半角, 数字以外削除
+        x_str = str(x).translate(str.maketrans({chr(0xFF10 + i): chr(0x30 + i) for i in range(10)}))
         clean_str = re.sub(r'[^\d.-]', '', x_str)
         return float(clean_str)
     except: return np.nan
 
-# ターゲット作成
-df_train['着順_num'] = df_train[rank_col].apply(force_numeric)
-df_train = df_train.dropna(subset=['着順_num'])
-df_train['target'] = (df_train['着順_num'] == 1).astype(int)
+# データ整形
+df_train['target'] = (df_train[col_map['着順']].apply(force_numeric) == 1).astype(int)
+df_train['指数'] = df_train[col_map['ZI']].apply(force_numeric).fillna(0)
+df_train['単勝オッズ'] = df_train[col_map['オッズ']].apply(force_numeric).fillna(0)
 
-# 特徴量作成
-# 学習時は「前走」のデータだけを使う
-if '前走補正' not in df_train.columns:
-    if '前走補9' in df_train.columns: df_train['前走補正'] = df_train['前走補9']
-    elif '補9' in df_train.columns: df_train['前走補正'] = df_train['補9']
-    elif '補正タイム.1' in df_train.columns: df_train['前走補正'] = df_train['補正タイム.1']
-    else: df_train['前走補正'] = 0
-
-if '指数' not in df_train.columns:
-    if 'ZI' in df_train.columns: df_train['指数'] = df_train['ZI']
-    else: df_train['指数'] = 0
-
-# 数値化 & 欠損埋め
-for f in ['指数', '前走補正']:
-    df_train[f] = df_train[f].apply(force_numeric).fillna(0)
-
-# ランク計算 (レース内順位)
-race_id_col = 'レースID(新)' if 'レースID(新)' in df_train.columns else 'レースID'
-if race_id_col in df_train.columns:
-    df_train['指数順位'] = df_train.groupby(race_id_col)['指数'].rank(ascending=False, method='min')
-    df_train['補正順位'] = df_train.groupby(race_id_col)['前走補正'].rank(ascending=False, method='min')
+# 補正タイム（前走データのみ使用）
+if '前走補正' in col_map:
+    df_train['前走補正'] = df_train[col_map['前走補正']].apply(force_numeric).fillna(0)
 else:
-    # IDがない場合、日付と場所で仮ID作成
-    if '日付(yyyy.mm.dd)' in df_train.columns and '場所' in df_train.columns:
-         df_train['rid'] = df_train['日付(yyyy.mm.dd)'].astype(str) + df_train['場所']
-         df_train['指数順位'] = df_train.groupby('rid')['指数'].rank(ascending=False, method='min')
-         df_train['補正順位'] = df_train.groupby('rid')['前走補正'].rank(ascending=False, method='min')
-    else:
-         df_train['指数順位'] = 10; df_train['補正順位'] = 10
+    # なければ0で埋める（エラーにしない）
+    df_train['前走補正'] = 0
 
-# 使用する特徴量
+# --- 🚨 レースIDの修正（18桁問題対策） ---
+# レースIDが長すぎる（馬番込み）場合は、末尾2桁をカットしてグルーピングする
+rid_col = col_map['レースID']
+df_train['rid_str'] = df_train[rid_col].astype(str)
+# 簡易判定: 平均頭数が5頭以下ならIDが細かすぎると判断
+if len(df_train) / df_train['rid_str'].nunique() < 5.0:
+    print("ℹ️ レースIDを補正します（馬番を除去してグループ化）")
+    df_train['rid_group'] = df_train['rid_str'].str[:-2]
+else:
+    df_train['rid_group'] = df_train['rid_str']
+
+# ランク計算
+df_train['指数順位'] = df_train.groupby('rid_group')['指数'].rank(ascending=False, method='min')
+df_train['補正順位'] = df_train.groupby('rid_group')['前走補正'].rank(ascending=False, method='min')
+
 features = ['指数', '前走補正', '指数順位', '補正順位']
-
-print("🔥 ZI & 補正タイム特化モデルを学習中...")
 X = df_train[features]
 y = df_train['target']
 
-# モデル学習
+# ------------------------------------------------
+# 2. モデル検証 & 学習
+# ------------------------------------------------
+print("\n📊 モデルの実力を検証中（データを8:2に分割）...")
+
+# 検証用データ分割
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+val_indices = X_val.index
+val_odds = df_train.loc[val_indices, '単勝オッズ']
+val_rids = df_train.loc[val_indices, 'rid_group']
+
+# 学習
 model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
-calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
-calibrated_model.fit(X, y)
-print("✅ 学習完了！")
+calibrated = CalibratedClassifierCV(model, method='isotonic', cv=3)
+calibrated.fit(X_train, y_train)
 
-# ==========================================
-# 1.5 モデル評価（的中率・回収率チェック）
-# ==========================================
-from sklearn.model_selection import train_test_split
+# 検証シミュレーション
+probs_val = calibrated.predict_proba(X_val)[:, 1]
+df_sim = pd.DataFrame({'rid': val_rids, 'target': y_val, 'prob': probs_val, 'odds': val_odds})
 
-# 回収率計算のために「単勝オッズ」が必要なので確保しておく
-# ※学習データに「単勝」または「単勝オッズ」という列がある前提です
-odds_col_train = None
-for c in ['単勝', '単勝オッズ', '確定単勝オッズ']:
-    if c in df_train.columns:
-        odds_col_train = c
-        break
+# 各レースで「AI推奨1位」の馬のみ購入
+bets = df_sim.sort_values('prob', ascending=False).groupby('rid').head(1)
+hits = bets[bets['target'] == 1]
 
-# オッズがない場合は評価できないので簡易学習のみ行う
-if odds_col_train is None:
-    print("⚠️ 学習データに「単勝オッズ」列がないため、回収率計算をスキップします。")
-    model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
-    calibrated_model = CalibratedClassifierCV(model, method='isotonic', cv=3)
-    calibrated_model.fit(X, y)
-else:
-    print("\n📊 モデルの精度と回収率を検証中（データを8:2に分割）...")
-    
-    # 検証用にデータを分割 (学習:80%, 検証:20%)
-    # ※厳密には時系列分割が望ましいですが、簡易チェックとしてランダム分割を使用
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    # 検証用データのオッズとレースID（グループ化用）を確保
-    val_indices = X_val.index
-    val_odds = df_train.loc[val_indices, odds_col_train].apply(force_numeric).fillna(0)
-    
-    # レースIDがない場合は擬似的に作る（評価用）
-    if 'レースID(新)' in df_train.columns:
-        val_rids = df_train.loc[val_indices, 'レースID(新)']
-    else:
-        # 適当なグループ化（あくまで簡易版）
-        val_rids = df_train.loc[val_indices].index 
+accuracy = (len(hits) / len(bets)) * 100
+recovery = (hits['odds'].sum() / len(bets)) * 100
 
-    # モデル学習 (学習データのみ使用)
-    base_model = lgb.LGBMClassifier(random_state=42, n_estimators=100)
-    calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
-    calibrated_model.fit(X_train, y_train)
+print(f"--- 🏁 検証結果 (テストデータ {len(bets)}レース) ---")
+print(f"🎯 的中率: {accuracy:.2f}%")
+print(f"💰 回収率: {recovery:.2f}%")
+print(f"--------------------------------------------------")
 
-    # 検証データで予測
-    probs_val = calibrated_model.predict_proba(X_val)[:, 1]
-    
-    # --- シミュレーション ---
-    # 検証データをDataFrameにまとめて計算
-    df_val_sim = X_val.copy()
-    df_val_sim['actual_target'] = y_val
-    df_val_sim['prob'] = probs_val
-    df_val_sim['odds'] = val_odds
-    df_val_sim['rid'] = val_rids
-    
-    # レースごとに「AI評価1位」の馬を抽出
-    # (確率が最も高い馬を1頭だけ買うシミュレーション)
-    target_bets = df_val_sim.sort_values('prob', ascending=False).groupby('rid').head(1)
-    
-    # 集計
-    total_races = len(target_bets)
-    hits = target_bets[target_bets['actual_target'] == 1]
-    hit_count = len(hits)
-    return_amount = hits['odds'].sum() * 100 # 100円賭け
-    bet_amount = total_races * 100
-    
-    accuracy = (hit_count / total_races) * 100
-    recovery_rate = (return_amount / bet_amount) * 100
-    
-    print(f"--- 🏁 検証結果 (テストデータ {total_races}レース分) ---")
-    print(f"🎯 的中率 (単勝1点買い): {accuracy:.2f}%")
-    print(f"💰 回収率 (単勝1点買い): {recovery_rate:.2f}%")
-    print(f"--------------------------------------------------")
+# 本番用再学習
+print("🔄 本番用に全データで再学習しています...")
+calibrated.fit(X, y)
+print("✅ 学習完了！次のステップ（予想）へ進めます。")
 
-    # 最後に全データで再学習（本番予想用）
-    print("🔄 本番用に全データで再学習しています...")
-    calibrated_model.fit(X, y)
-
-print("✅ 学習完了！")
 
 # ------------------------------------------------
 # 2. 最新オッズでの予想 (過去3走評価)
