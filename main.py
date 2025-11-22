@@ -10,7 +10,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelEncoder
 
 # ファイル設定
-train_file = 'race_data_5years.csv'
+train_file = 'race_5years_zi_hoseitime_kai.csv'
 entry_file = 'entry_table.csv'
 
 # 数値化関数
